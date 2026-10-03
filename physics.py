@@ -342,22 +342,302 @@ def allsolve_payload(d: Design) -> dict:
     }
 
 
-def run_quanscient_allsolve(params: Design | dict) -> dict:
-    """Submit the 3D model to Allsolve. Creates the cloud project via the SDK; the
-    geometry/physics/solve stages are mapped from allsolve_payload() block by block.
-    Never raises – returns a status dict so the UI can fall back to the surrogate."""
+def run_quanscient_allsolve(params: "Design | dict", wait_for_results: bool = False) -> dict:
+    """Submit the 3D conjugate laminar-flow + heat-transfer model to Quanscient Allsolve.
+
+    Pipeline:
+      1. Create project (geometry pipeline V2)
+      2. Build U-bend geometry with CSG boolean ops
+      3. Define regions (air channel, GDL volume, inlet/outlet/wall faces)
+      4. Assign materials (air, GDL)
+      5. Add LaminarFlow + HeatFluid physics with boundary conditions
+      6. Create mesh
+      7. Create & start static simulation
+      8. Optionally wait and fetch scalar results
+
+    Never raises – returns a status dict so the UI can fall back to the surrogate.
+    """
     d = params if isinstance(params, Design) else Design(**params)
     payload = allsolve_payload(d)
+
     try:
-        import allsolve  # pip install allsolve  (Python ≥ 3.10), credentials in .env
+        import allsolve as _as  # pip install allsolve  (Python ≥ 3.10)
     except ImportError:
         return {"status": "sdk_not_installed", "payload": payload,
-                "message": "pip install allsolve and add ALLSOLVE_ACCESS_KEY / SECRET_KEY / HOST to .env"}
+                "message": "Aja ensin: pip install allsolve"}
+
+    import os
+    from dotenv import load_dotenv
+    load_dotenv(".env")
+    if not os.getenv("ALLSOLVE_ACCESS_KEY") and os.getenv("quancient_key"):
+        os.environ["ALLSOLVE_ACCESS_KEY"] = os.getenv("quancient_key")
+
+    # -----------------------------------------------------------------------
+    # Geometry dimensions (SI → mm for Allsolve CAD)
+    # -----------------------------------------------------------------------
+    w   = d.w_mm          # channel width [mm]
+    rin = d.r_in_mm       # inner bend radius [mm]
+    dep = DEPTH * 1e3     # channel depth [mm]
+    leg = LEG * 1e3       # straight leg length [mm]
+    gdl = T_GDL * 1e3     # GDL thickness [mm]
+    rib = d.rib_mm        # inner rib width = 2·R_in [mm]
+    T_inlet_K = T_COOLANT + 273.15   # inlet temperature [K]
+    th = thermal(d)
+    q_flux = float(th["q"])          # W/m² membrane heat flux
+
     try:
-        client = allsolve.Client(dotenv_file=".env")
-        project = client.create_project(name=payload["project"]["name"],
-                                        description=json.dumps(payload["geometry"]))
-        return {"status": "project_created", "project_url": client.get_url(project), "payload": payload,
-                "message": "Cloud project created. Next: geometry, physics, mesh and solve stages."}
+        client = _as.Client()
+        project = client.create_project(
+            name=payload["project"]["name"],
+            description=payload["project"]["description"],
+            geometry_pipeline_version=_as.project.GeometryPipelineVersion.V2,
+        )
+        project_url = client.get_url(project)
+
+        # -------------------------------------------------------------------
+        # 2. GEOMETRY  –  U-bend channel (one leg + 180° arc + return leg)
+        # Coordinate system: X along first leg, Y across channel, Z depth.
+        # We build the air channel as a union of two rectangular legs and a
+        # half-torus (approximated via a cylinder boolean for simplicity).
+        # -------------------------------------------------------------------
+        builder = project.geometry_builder()
+
+        # First straight leg:  X ∈ [0, leg],  Y ∈ [0, w],  Z ∈ [0, dep]
+        leg1 = builder.add_box(
+            x=0.0, y=0.0, z=0.0,
+            dx=leg, dy=w, dz=dep,
+        )
+        # Return straight leg: X ∈ [0, leg],  Y ∈ [rib+w, rib+2w],  Z ∈ [0, dep]
+        y2 = rib + w
+        leg2 = builder.add_box(
+            x=0.0, y=y2, z=0.0,
+            dx=leg, dy=w, dz=dep,
+        )
+        # 180° bend: full cylinder minus inner cylinder, then intersect with
+        # half-plane X ≥ leg.  Centre at (leg, rib/2 + w/2).
+        y_c = w + rib / 2.0          # bend arc centre Y
+        r_out = rin + w              # outer wall radius
+        bend_outer = builder.add_cylinder(
+            x=leg, y=y_c - r_out, z=0.0,
+            dx=0.0, dy=0.0, dz=dep,
+            r=r_out,
+        )
+        bend_inner = builder.add_cylinder(
+            x=leg, y=y_c - rin, z=0.0,
+            dx=0.0, dy=0.0, dz=dep,
+            r=rin,
+        )
+        bend_annulus = builder.add_difference(bend_outer, [bend_inner])
+        # Keep only the half with Y ≤ y_c (the 180° arc on the +X side)
+        clip_box = builder.add_box(
+            x=leg - w, y=y_c - r_out - 1, z=-1.0,
+            dx=r_out + w + 1, dy=2 * r_out + 2, dz=dep + 2,
+        )
+        bend_channel = builder.add_intersection(bend_annulus, clip_box)
+
+        # Merge all air-channel parts
+        air_union = builder.add_union(leg1, [leg2, bend_channel])
+
+        # GDL slab below the channel (membrane side, Z ∈ [-gdl, 0])
+        # Full-width slab covering both legs + rib
+        gdl_vol = builder.add_box(
+            x=0.0, y=0.0, z=-gdl,
+            dx=leg, dy=2 * w + rib, dz=gdl,
+        )
+
+        # Fragment all so touching faces are shared
+        builder.add_fragment_all([air_union, gdl_vol])
+        geo_job = builder.build()
+        geo_job.wait()
+        geo = project.get_geometry()
+        elems = geo.get_elements()
+
+        # -------------------------------------------------------------------
+        # 3. REGIONS
+        # -------------------------------------------------------------------
+        # Volume regions (tags from geometry build – volumes 1=air, 2=GDL)
+        vol_air = project.create_region_basic(
+            name="air_channel",
+            entity_type=_as.rawapi.EntityType.VOLUME,
+            entity_tags=[1],
+        )
+        vol_gdl = project.create_region_basic(
+            name="gdl",
+            entity_type=_as.rawapi.EntityType.VOLUME,
+            entity_tags=[2],
+        )
+        # Inlet face (X=0, Y ∈ [0,w], first leg)
+        face_inlet = project.create_region_basic(
+            name="inlet",
+            entity_type=_as.rawapi.EntityType.SURFACE,
+            entity_tags=[1],
+        )
+        # Outlet face (X=0, Y ∈ [rib+w, rib+2w], return leg)
+        face_outlet = project.create_region_basic(
+            name="outlet",
+            entity_type=_as.rawapi.EntityType.SURFACE,
+            entity_tags=[2],
+        )
+        # Membrane face (Z = -gdl bottom of GDL)
+        face_membrane = project.create_region_basic(
+            name="membrane",
+            entity_type=_as.rawapi.EntityType.SURFACE,
+            entity_tags=[3],
+        )
+        # Coolant face (top of GDL / rib interface, Z=0 under ribs)
+        face_coolant = project.create_region_basic(
+            name="coolant_plate",
+            entity_type=_as.rawapi.EntityType.SURFACE,
+            entity_tags=[4],
+        )
+
+        # -------------------------------------------------------------------
+        # 4. MATERIALS
+        # -------------------------------------------------------------------
+        # Air at ~65 °C
+        project.create_material(
+            name="Air 65C",
+            target_region=vol_air,
+            density=AIR_RHO,
+            dynamic_viscosity=AIR_MU,
+            heat_capacity=1008.0,
+            thermal_conductivity=0.029,
+        )
+        # GDL (carbon paper, anisotropic k)
+        project.create_material(
+            name="GDL",
+            target_region=vol_gdl,
+            density=450.0,
+            heat_capacity=710.0,
+            thermal_conductivity=[
+                [K_GDL_IP, 0.0, 0.0],
+                [0.0, K_GDL_IP, 0.0],
+                [0.0, 0.0, K_GDL_TP],
+            ],
+        )
+
+        # -------------------------------------------------------------------
+        # 5. PHYSICS
+        # -------------------------------------------------------------------
+        physics_set = project.get_default_physics_set()
+
+        # --- Laminar Flow (air channel only) ---
+        lf = physics_set.add_physics(_as.Physics.LaminarFlow(target=vol_air))
+
+        # Inlet: normal velocity constraint (v_in in X-direction)
+        lf.add_interaction(_as.Interaction.LaminarFlowVelocityConstraint(
+            name="Inlet velocity",
+            laminar_flow_velocity_constraint=[[1, d.v_in], [0, 0], [0, 0]],
+            target=face_inlet,
+        ))
+        # Outlet: zero pressure
+        lf.add_interaction(_as.Interaction.LaminarFlowPressureConstraint(
+            name="Outlet pressure",
+            laminar_flow_pressure_constraint=0.0,
+            target=face_outlet,
+        ))
+
+        # --- Heat in fluid (air channel) ---
+        hf = physics_set.add_physics(_as.Physics.HeatFluid(target=vol_air))
+        hf.add_interaction(_as.Interaction.HeatFluidConstraint(
+            name="Inlet temperature",
+            heat_fluid_constraint=T_inlet_K,
+            target=face_inlet,
+        ))
+
+        # --- Heat in solid (GDL) ---
+        hs = physics_set.add_physics(_as.Physics.HeatTransfer(target=vol_gdl))
+        # Membrane: prescribed heat flux (reaction heat from electrochemistry)
+        hs.add_interaction(_as.Interaction.HeatTransferHeatFlux(
+            name="Membrane heat flux",
+            heat_transfer_heat_flux=q_flux,
+            target=face_membrane,
+        ))
+        # Coolant plate: fixed temperature (coolant loop)
+        hs.add_interaction(_as.Interaction.HeatTransferTemperatureConstraint(
+            name="Coolant temperature",
+            temperature_constraint=T_inlet_K,
+            target=face_coolant,
+        ))
+
+        # -------------------------------------------------------------------
+        # 6. MESH
+        # -------------------------------------------------------------------
+        mesh = project.create_mesh(
+            mesh_settings=_as.MeshSettings(
+                name="U-bend mesh",
+                mesh_size_max=w / 6.0,   # max element size ≈ w/6 mm
+                mesh_size_min=w / 20.0,
+                max_run_time_minutes=30,
+            )
+        )
+        mesh.start()
+        mesh.wait()
+        if not mesh.get_status().succeeded:
+            return {"status": "mesh_failed", "payload": payload,
+                    "message": f"Mesh epäonnistui: {mesh.get_status_reason()}"}
+
+        # -------------------------------------------------------------------
+        # 7. SIMULATION – steady-state
+        # -------------------------------------------------------------------
+        sim = project.create_simulation_static(
+            name="CellShield steady-state",
+            description=f"w={d.w_mm} mm · R_in={d.r_in_mm} mm · v={d.v_in} m/s · i={d.i_acm2} A/cm²",
+            max_run_time_minutes=60,
+            mesh=mesh,
+        )
+
+        # Outputs: velocity magnitude + membrane temperature
+        sim.add_outputs([
+            _as.Output.FieldOutput(
+                name="velocity_magnitude",
+                expression="norm(velocity)",
+            ),
+            _as.Output.FieldOutput(
+                name="membrane_temperature",
+                expression="temperature - 273.15",  # → °C
+                target=face_membrane,
+            ),
+            _as.Output.ValueOutput(
+                name="max_velocity",
+                expression="maxOver(norm(velocity), air_channel)",
+            ),
+            _as.Output.ValueOutput(
+                name="max_temperature_C",
+                expression="maxOver(temperature - 273.15, membrane)",
+            ),
+        ])
+
+        sim.start()
+
+        result = {
+            "status": "simulation_started",
+            "project_url": project_url,
+            "payload": payload,
+            "message": (f"3D-simulaatio käynnistetty Allsolvessa! "
+                        f"Tarkista tulokset: {project_url}"),
+        }
+
+        if wait_for_results:
+            sim.wait()
+            if sim.get_status().succeeded:
+                vals = sim.get_output_values()
+                result["status"] = "simulation_done"
+                result["results"] = vals
+                result["message"] = (
+                    f"Simulaatio valmis! "
+                    f"T_max={vals.get('max_temperature_C', '?'):.1f} °C  "
+                    f"|u|_max={vals.get('max_velocity', '?'):.2f} m/s"
+                )
+            else:
+                result["status"] = "simulation_failed"
+                result["message"] = f"Simulaatio epäonnistui: {sim.get_status_reason()}"
+
+        return result
+
     except Exception as e:  # noqa: BLE001
-        return {"status": "error", "payload": payload, "message": f"{type(e).__name__}: {e}"}
+        msg = str(e)
+        if any(kw in msg.lower() for kw in ("secret", "unauthorized", "401", "forbidden")):
+            msg = (f"Autentikaatio epäonnistui – tarkista ALLSOLVE_ACCESS_KEY ja "
+                   f"ALLSOLVE_SECRET_KEY .env-tiedostossa. Alkuperäinen virhe: {e}")
+        return {"status": "error", "payload": payload, "message": msg}

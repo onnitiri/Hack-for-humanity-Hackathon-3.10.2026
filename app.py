@@ -206,12 +206,35 @@ with st.expander("Validation – laminar friction and conservation checks"):
 # --- Allsolve hook -------------------------------------------------------------------------------------
 with st.expander("☁️ Quanscient Allsolve – 3D conjugate verification"):
     st.write("The surrogate is fast enough for live exploration; the selected design is verified with a full 3D "
-             "laminar Navier–Stokes + heat transfer model in the cloud.")
-    if st.button("Submit current design to Allsolve"):
-        with st.spinner("Contacting Allsolve…"):
-            out = P.run_quanscient_allsolve(design)
-        {"project_created": st.success, "sdk_not_installed": st.warning}.get(out["status"], st.error)(
-            f"{out['status']}: {out['message']}")
+             "laminar Navier\u2013Stokes + conjugate heat transfer model in the cloud.")
+    st.caption(
+        "Pipeline: geometry (CSG boolean ops) → materials → LaminarFlow + HeatFluid + HeatTransfer "
+        "physics → BCs → mesh → steady-state solve → field & scalar outputs"
+    )
+    wait_results = st.checkbox("Wait for results (blocks UI ~5–15 min)", value=False)
+    if st.button("🚀 Submit current design to Allsolve"):
+        with st.spinner("Rakentaa geometria, fysiikka, mesh ja käynnistää simulaation…"):
+            out = P.run_quanscient_allsolve(design, wait_for_results=wait_results)
+        status_fn = {
+            "project_created": st.info,
+            "simulation_started": st.success,
+            "simulation_done": st.success,
+            "mesh_failed": st.error,
+            "simulation_failed": st.error,
+            "sdk_not_installed": st.warning,
+        }.get(out["status"], st.error)
+        status_fn(f"**{out['status']}**: {out['message']}")
         if out.get("project_url"):
-            st.markdown(f"[Open project in Allsolve]({out['project_url']})")
+            st.markdown(f"[🔗 Avaa projekti Allsolvessa]({out['project_url']})")
+        if out.get("results"):
+            st.subheader("3D-simulaation tulokset")
+            r = out["results"]
+            rc1, rc2 = st.columns(2)
+            kpi(rc1, "3D T_max (membraani)",
+                f"{r.get('max_temperature_C', '?'):.1f} °C",
+                f"Surrogate: {tmax:.1f} °C",
+                level(r.get('max_temperature_C', 0), P.T_WARN, P.T_CRIT + 1e-9))
+            kpi(rc2, "3D |u|_max",
+                f"{r.get('max_velocity', '?'):.2f} m/s",
+                f"Inlet: {design.v_in:.2f} m/s", GREY)
     st.json(P.allsolve_payload(design), expanded=False)
